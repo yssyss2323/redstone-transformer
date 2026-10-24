@@ -1,39 +1,81 @@
-# 레드스톤 트랜스포머 — 0단계: 학습 + 정수 레퍼런스
+# Redstone Transformer
 
-서로 다른 숫자 4개(0~7)를 정렬하는 1층 1헤드 디코더 온리 트랜스포머를,
-레드스톤 하드웨어 규칙(2의 거듭제곱 스케일, int4 가중치, 반올림 시프트, 지수 ROM softmax)으로 학습합니다.
+A tiny decoder-only transformer, quantized to integers and designed to run on a programmable NPU built from Minecraft redstone.
 
-## 실행 순서 (Colab 또는 로컬, CPU로 충분)
+The goal is not size or speed. It is to make every step of a transformer **visible**: embeddings, Q/K/V, the KV cache filling up, softmax turning scores into probabilities, attention picking a position, and the next token appearing, all as lamps you can walk past.
 
-```bash
-pip install torch          # Colab은 이미 설치되어 있음
+## The task
 
-# 1) 한 조합 학습 + weights.json 저장 (CPU 기준 1~3분)
-python train.py --d 8 --ffn 16 --export
+Sort four distinct digits (0-7) by generating the answer one token at a time.
 
-# 2) 정수 레퍼런스 검증 + 예시 덤프
-python int_ref.py
-python int_ref.py 3 6 1 4
-python int_ref.py --no-cache 3 6 1 4
-
-# 3) (선택) d_model / FFN 크기 비교. 12회 학습이라 CPU로 20~30분
-python train.py --sweep
+```
+input:  3 6 1 4 |
+output:           1 3 4 6
 ```
 
-## 확인할 것
+## The model
 
-| 체크 | 기대값 |
+| | |
 |---|---|
-| `train.py` 마지막 줄 `int_test` | 1.0 (테스트 336개 전부 정답) |
-| `int_ref.py`의 `정렬 정답` | 1680/1680 |
-| `int_ref.py`의 `PyTorch QAT 일치` | 1680/1680 (하나라도 다르면 정수 규칙 재현이 틀린 것) |
-| attention 히스토리 | 처음 3개 출력은 정답 숫자 위치에 `@@`, 마지막 출력은 퍼지거나 자기 자신을 봄 |
-| KV 캐시 on/off | 8레인 연산 약 410회 vs 약 760회 |
+| Architecture | Decoder-only, 1 layer, 1 head, no LayerNorm |
+| d_model / FFN | 6 / 12 (ReLU) |
+| Parameters | 456 |
+| Weights | int4, power-of-two scales |
+| Activations | int8, requantized with rounding shifts |
+| Softmax | 16-entry exp lookup ROM, one division per step |
+| Accuracy | 1680 / 1680 (every possible input) |
 
-## 스윕에서 볼 것
+## The hardware
 
-- `float_te`: 실수 모델 테스트 정확도
-- `int_noQAT`: 보정만 하고 QAT 전 정수 정확도 (보통 크게 떨어짐)
-- `int_te`: QAT 후 정수 테스트 정확도 ← **크기 결정 기준**
+A programmable NPU with an 8-lane multiply-accumulate engine, a 56-row weight ROM, a KV cache, a softmax unit and a 12-instruction ISA. The whole inference is a 22-instruction program (85 instructions executed, 322 engine operations per run). See [`HARDWARE.md`](HARDWARE.md) (Korean) for the full spec.
 
-d_model 4는 실패, 8(FFN 16)은 100%가 확인됐고, 6은 아직 결론이 안 났습니다.
+## Files
+
+| File | Purpose |
+|---|---|
+| `train.py` | Trains the model with quantization-aware training under the hardware's integer rules, exports `weights.json` |
+| `int_ref.py` | Pure-integer reference implementation with KV cache. The golden model for everything else |
+| `npu.py` | ISA, assembler, the inference program, and an instruction-level simulator |
+| `rom_gen.py` | Generates the bit layout of all four ROMs into `rom/` |
+| `weights.json` | Trained integer weights (d_model 6, FFN 12, seed 1) |
+| `rom/` | Weight, constant, exp-LUT and instruction ROM images |
+
+## Quick start
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate           # macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt  # CPU-only torch is enough
+
+python train.py --d 6 --ffn 12 --seed 1 --export   # train + export weights.json
+python int_ref.py                # 1680/1680 sorted, 1680/1680 bit-exact vs PyTorch
+python int_ref.py --ranges       # exact worst-case range of every value -> bit widths
+python npu.py                    # simulator matches int_ref at every stage, no bit-width violations
+python npu.py --trace 5 2 7 0    # instruction-by-instruction trace
+python rom_gen.py                # write ROM images to rom/
+```
+
+## Verification chain
+
+Each layer is checked against the one before it on all 1680 inputs:
+
+```
+PyTorch QAT model  ->  int_ref.py (pure integers)  ->  npu.py (ISA simulator)  ->  redstone
+```
+
+When a redstone module is built, its lamps are compared against `npu.py --trace`.
+
+## Status
+
+- [x] Model trained and quantized
+- [x] Bit widths fixed from exhaustive range analysis
+- [x] Hardware architecture, ISA and program
+- [x] Simulator verified bit-exact
+- [x] ROM images
+- [ ] Redstone modules (Minecraft Java 26.3)
+- [ ] ROM schematic generator
+- [ ] Exhibition hall with per-stage displays
+
+## Built alongside
+
+A computer architecture course that goes from transistors to a working CPU. This project is the hands-on version: the same building blocks, ending in a transformer instead of a calculator.
