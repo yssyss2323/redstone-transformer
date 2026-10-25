@@ -1,3 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+*.ipynb
+study.py
+study_basic.py
+CLAUDE.md
