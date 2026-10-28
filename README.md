@@ -27,7 +27,16 @@ output:           1 3 4 6
 
 ## The hardware
 
-A programmable NPU with an 8-lane multiply-accumulate engine, a 56-row weight ROM, a KV cache, a softmax unit and a 12-instruction ISA. The whole inference is a 22-instruction program (85 instructions executed, 322 engine operations per run). See [`HARDWARE.md`](HARDWARE.md) (Korean) for the full spec.
+A programmable NPU with an 8-lane multiply-accumulate engine, a weight ROM, a KV cache, a softmax unit and a 12-instruction ISA. The whole inference is a 22-instruction program (85 instructions executed, 322 engine operations per run). See [`HARDWARE.md`](HARDWARE.md) (Korean) for the full spec.
+
+The MAC engine is **bit-serial over the weights**. Instead of 8 parallel multipliers, each lane is just a row of AND gates: for every weight bit plane `k` (MSB first), the selected activations are summed and accumulated as `acc = 2*acc + S_k`, with the MSB plane (weight -8) negated. In redstone, wiring is the expensive resource, so this trades about 3x run time for about 5x less area and almost no wire crossings.
+
+| Engine part | Implementation |
+|---|---|
+| Lane gating | Top-controlled AND gates, 8 lanes x 8 bits |
+| Lane sum | Chain of 7 ripple-carry 12-bit adders; signed lanes via MSB inversion plus a single -1024 constant |
+| Accumulator | 16-bit adder + 16-bit master-slave register (repeater-lock flip-flops) + shift-by-one feedback |
+| First round | XOR conditional inverter on the adder input plus carry-in (two's complement negation) |
 
 ## Files
 
@@ -72,7 +81,11 @@ When a redstone module is built, its lamps are compared against `npu.py --trace`
 - [x] Hardware architecture, ISA and program
 - [x] Simulator verified bit-exact
 - [x] ROM images
-- [ ] Redstone modules (Minecraft Java 26.3)
+- [x] Redstone: gates, full adder, 8/12/16-bit ripple-carry adders
+- [x] Redstone: 8-lane bit-serial MAC engine with 16-bit accumulator
+- [x] **M1: first dot product in Minecraft. Q[0] = 33 computed from the real embedding and the real Wq column**
+- [ ] M2: weight ROM (bit-plane layout) and automatic round/column sequencing for the full Q vector
+- [ ] Remaining redstone modules (KV cache, softmax unit, FFN, control unit)
 - [ ] ROM schematic generator
 - [ ] Exhibition hall with per-stage displays
 
