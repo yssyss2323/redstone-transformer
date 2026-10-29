@@ -14,6 +14,10 @@
 import itertools
 import json
 import sys
+try:
+    sys.stdout.reconfigure(encoding="utf-8")   # 윈도우에서 > 파일 저장 시 한글 깨짐 방지
+except AttributeError:
+    pass
 
 W = json.load(open("weights.json"))
 D, FFN, SEP, E = W["d"], W["ffn"], W["sep"], W["E"]

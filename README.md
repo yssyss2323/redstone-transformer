@@ -25,18 +25,27 @@ output:           1 3 4 6
 | Softmax | 16-entry exp lookup ROM, one division per step |
 | Accuracy | 1680 / 1680 (every possible input) |
 
-## The hardware
+## The hardware (spec v0.2)
 
-A programmable NPU with an 8-lane multiply-accumulate engine, a weight ROM, a KV cache, a softmax unit and a 12-instruction ISA. The whole inference is a 22-instruction program (85 instructions executed, 322 engine operations per run). See [`HARDWARE.md`](HARDWARE.md) (Korean) for the full spec.
+A programmable NPU with a **bit-serial** multiply-accumulate engine. See [`HARDWARE.md`](HARDWARE.md) (Korean) for the full spec; `npu.py` simulates exactly this structure.
 
-The MAC engine is **bit-serial over the weights**. Instead of 8 parallel multipliers, each lane is just a row of AND gates: for every weight bit plane `k` (MSB first), the selected activations are summed and accumulated as `acc = 2*acc + S_k`, with the MSB plane (weight -8) negated. In redstone, wiring is the expensive resource, so this trades about 3x run time for about 5x less area and almost no wire crossings.
+**Bit-serial engine.** Instead of parallel multipliers, each lane is a row of AND gates. One operand sits in the lanes (an activation vector, 8 bits per lane). The other operand arrives one bit plane at a time on 12 control lines, one bit per lane. Every round the enabled lanes are summed and accumulated as `acc = 2*acc + S`; the MSB round is negated. In redstone, wiring is the expensive resource, so this trades run time for far less area and almost no wire crossings.
 
-| Engine part | Implementation |
+**Memories feed the control lines.** The weight ROM, the K cache and the V cache all share one shape: one row = the same bit of 12 lanes. A row selected by a ring counter drives the control lines directly; unselected memories output zero, so they can simply be wired together.
+
+**Registers live next to the lanes.** Each lane has three 8-bit register slots on a glass floor above the engine. Vectors that are never alive at the same time share a slot (X; Q then A then H; scores then probabilities). Results are written one element per output column through a broadcast write bus and per-lane lock lines.
+
+| Part | Implementation |
 |---|---|
-| Lane gating | Top-controlled AND gates, 8 lanes x 8 bits |
-| Lane sum | Chain of 7 ripple-carry 12-bit adders; signed lanes via MSB inversion plus a single -1024 constant |
-| Accumulator | 16-bit adder + 16-bit master-slave register (repeater-lock flip-flops) + shift-by-one feedback |
-| First round | XOR conditional inverter on the adder input plus carry-in (two's complement negation) |
+| Lane gating | Top-controlled AND gates, one row per lane |
+| Lane sum | Chain of 12-bit ripple-carry adders; signed lanes via bit-7 inversion plus one constant |
+| Accumulator | 16-bit adder, 16-bit master-slave register (repeater-lock flip-flops), shift-by-one feedback |
+| First round | XOR conditional inverter plus carry-in (two's complement negation) |
+| Weight ROM | Torch ROM, one row per (column, bit plane), selected by a 24-stage ring counter |
+| Round control | 4-stage ring counter generating first-round and feedback-enable signals |
+| Lane registers | Repeater latches on an upper glass floor, write strobe = delayed clock, lock line = strobe OR ring row |
+
+The full inference is a 19-instruction program: 73 instructions executed, 1,392 engine rounds per run.
 
 ## Files
 
@@ -44,10 +53,11 @@ The MAC engine is **bit-serial over the weights**. Instead of 8 parallel multipl
 |---|---|
 | `train.py` | Trains the model with quantization-aware training under the hardware's integer rules, exports `weights.json` |
 | `int_ref.py` | Pure-integer reference implementation with KV cache. The golden model for everything else |
-| `npu.py` | ISA, assembler, the inference program, and an instruction-level simulator |
-| `rom_gen.py` | Generates the bit layout of all four ROMs into `rom/` |
+| `npu.py` | ISA, assembler, inference program, and a simulator of the v0.2 bit-serial hardware (shared register slots, bit-plane caches, garbage initial state) |
+| `rom_gen.py` | Generates all ROM images into `rom/`; `--run` prints the expected lamp values for every button press |
 | `weights.json` | Trained integer weights (d_model 6, FFN 12, seed 1) |
-| `rom/` | Weight, constant, exp-LUT and instruction ROM images |
+| `rom/` | ROM images; `weight_rom_bitplane.txt` is the one built in Minecraft |
+| `docs/measurements.md` | Measured redstone delays and milestone logs |
 
 ## Quick start
 
@@ -59,9 +69,10 @@ pip install -r requirements.txt  # CPU-only torch is enough
 python train.py --d 6 --ffn 12 --seed 1 --export   # train + export weights.json
 python int_ref.py                # 1680/1680 sorted, 1680/1680 bit-exact vs PyTorch
 python int_ref.py --ranges       # exact worst-case range of every value -> bit widths
-python npu.py                    # simulator matches int_ref at every stage, no bit-width violations
+python npu.py                    # v0.2 simulator matches int_ref at every stage, no bit-width violations
 python npu.py --trace 5 2 7 0    # instruction-by-instruction trace
 python rom_gen.py                # write ROM images to rom/
+python rom_gen.py --run Wq 2 0 3 -3 -7 5   # expected values for every button press
 ```
 
 ## Verification chain
@@ -69,24 +80,23 @@ python rom_gen.py                # write ROM images to rom/
 Each layer is checked against the one before it on all 1680 inputs:
 
 ```
-PyTorch QAT model  ->  int_ref.py (pure integers)  ->  npu.py (ISA simulator)  ->  redstone
+PyTorch QAT model  ->  int_ref.py (pure integers)  ->  npu.py (hardware simulator)  ->  redstone
 ```
 
-When a redstone module is built, its lamps are compared against `npu.py --trace`.
+When a redstone module is built, its lamps are compared against `rom_gen.py --run` and `npu.py --trace`.
 
 ## Status
 
 - [x] Model trained and quantized
 - [x] Bit widths fixed from exhaustive range analysis
-- [x] Hardware architecture, ISA and program
-- [x] Simulator verified bit-exact
-- [x] ROM images
+- [x] Hardware spec v0.2 (bit-serial) with a bit-exact simulator
 - [x] Redstone: gates, full adder, 8/12/16-bit ripple-carry adders
 - [x] Redstone: 8-lane bit-serial MAC engine with 16-bit accumulator
-- [x] **M1: first dot product in Minecraft. Q[0] = 33 computed from the real embedding and the real Wq column**
-- [ ] M2: weight ROM (bit-plane layout) and automatic round/column sequencing for the full Q vector
-- [ ] Remaining redstone modules (KV cache, softmax unit, FFN, control unit)
-- [ ] ROM schematic generator
+- [x] **M1: first dot product in Minecraft.** Q[0] = 33 from the real embedding and the real Wq column
+- [x] **M2: full Q vector, automatic.** Bit-plane weight ROM, ring-counter sequencing, and lane-side registers: one button, 24 presses, Q = [33, -4, 14, 9, -4, 4] stored in redstone latches
+- [ ] M3: attention probabilities (Q into lanes, K cache, 8-round mode, softmax unit)
+- [ ] M4: one full layer (V cache, MIXV, residuals, FFN with 12 lanes)
+- [ ] M5: full sort (control unit, instruction ROM, token tape)
 - [ ] Exhibition hall with per-stage displays
 
 ## Built alongside
