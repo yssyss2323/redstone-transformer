@@ -6,9 +6,11 @@
   2. 트랜스포머 추론을 NPU 어셈블리 프로그램(PROGRAM)으로 작성
   3. 어셈블러가 프로그램을 16비트 기계어로 바꿈 (시프트 양은 weights.json의 지수로 자동 계산)
   4. 시뮬레이터가 마크 회로와 같은 방식으로 실행 (HARDWARE.md v0.2)
-     - 엔진: 레인 12개, 비트 직렬 (c 선 비트 평면마다 acc = 2*acc + S, 첫 바퀴만 -S)
-     - 레인 옆 레지스터 3칸을 이름이 다른 레지스터들이 나눠 씀 (덮어쓰기까지 그대로 흉내)
-     - K, V 캐시는 c 선 쪽 비트 평면 메모리, 시작할 때 쓰레기 값으로 채워서 초기화 없이도 맞는지 확인
+     - 엔진: 레인 12개, 비트 직렬 (c 선 비트 평면마다 acc = 2*acc + S, 부호 있는 c 값이면 첫 바퀴만 -S)
+     - 레인 옆 레지스터 칸을 이름이 다른 레지스터들이 나눠 씀 (덮어쓰기까지 그대로 흉내)
+     - v0.3: K, V 캐시도 레인 옆 칸. SCORE는 레인 = K_j, c 선 = Q의 비트 / MIXV는 레인 = V, c 선 = p의 비트
+       (c 선 비트는 각 레인 위 래치에서 바퀴마다 비트 하나를 골라 그 레인 c 선에 넣음)
+     - 모든 칸과 캐시를 쓰레기 값으로 채운 채 시작해서, 초기화 없이도 맞는지 확인
      - 쓰기 유닛: 재양자화 시프트 -> 편향 -> ReLU -> (MVADD면) 레인에서 읽은 옛값 더하기
   5. 결과와 정거장별 중간값을 int_ref.py(정답지)와 비교
 
@@ -34,7 +36,6 @@ SLOTS = 3           # 레인마다 레지스터 칸 수
 WIDTH = {                     # 이름: (최소, 최대)  - 이 범위를 벗어나면 위반으로 기록
     "레지스터(int8)": (-127, 127),   # 포화 회로 없음: 이 범위 밖이면 int_ref와 달라짐
     "레인 입력(int8)": (-128, 127),  # 보통 모드: 부호 있는 8비트 (비트 7 NOT + 상수 -1536)
-    "레인 입력(부호 없음)": (0, 255),  # MIXV 모드: p는 0~128이라 비트 7을 +128로 (NOT 끄고 상수 0)
     "레인 합 S(12비트)": (-2048, 2047),
     "누산기(16비트)": (-32768, 32767),   # 바퀴 중간값까지 전부 검사
     "쓰기 유닛 중간값(9비트)": (-256, 255),
@@ -72,9 +73,9 @@ gen:
     MV     Q, Wq        ; Q <- Wq · X
     MV     KC, Wk
     MV     VC, Wv
-    SCORE               ; s_j <- Q · K_j        (j = 0..P), 칸 2에 저장
+    SCORE               ; s_j <- Q · K_j        (j = 0..P): 레인 = K_j 칸, c 선 = Q 비트. 칸 2에 저장
     SOFTMAX             ; p_j <- 정수 softmax   (칸 2를 읽고 같은 칸에 p 쓰기)
-    MIXV                ; A <- Σ p_j · V_j      (레인 = 위치, c 선 = V 캐시)
+    MIXV                ; A <- Σ p_j · V_j      (레인 = 위치 j의 V 칸, c 선 = p 비트, 첫 바퀴 빼기 없음)
     MVADD  X, Wo        ; X <- X + Wo · A        (residual 1)
     MV     H, W1        ; H <- ReLU(W1 · X + b1)  (편향, ReLU는 쓰기 유닛에서)
     MVADD  X, W2        ; X <- X + (W2 · H + b2)  (residual 2 완성)
@@ -194,9 +195,9 @@ class NPU:
         self.PC = 0
         # 레인 옆 레지스터: [칸][레인]. 전원 켤 때 상태를 모르니 쓰레기 값으로 시작
         self.slot = [[junk() for _ in range(LANES)] for _ in range(SLOTS)]
-        # c 선 쪽 캐시 (비트 평면 메모리). 셀이 있는 레인만 쓰레기, 셀이 없는 레인은 0
-        self.K = [[junk() if i < D else 0 for i in range(LANES)] for _ in range(8)]   # K[위치][원소]
-        self.V = [[junk() if j < 8 else 0 for j in range(LANES)] for _ in range(D)]   # V[원소][위치]
+        # 레인 옆 캐시 칸 (v0.3). 칸이 있는 레인만 쓰레기, 칸이 없는 레인은 레인 입력 0
+        self.K = [[junk() if i < D else 0 for i in range(LANES)] for _ in range(8)]   # K 칸[위치 j][레인 i] = K_j[i]
+        self.V = [[junk() if j < 8 else 0 for j in range(LANES)] for _ in range(D)]   # V 칸[원소 i][레인 j] = V_j[i]
         self.rounds = {}                                   # 연산별 바퀴 수
         self.writes = 0                                    # 레지스터/캐시 쓰기 횟수
         self.instr_count = 0
@@ -228,17 +229,18 @@ class NPU:
         return self.slot[SLOT_OF[name]][j]
 
     # -- 엔진: 비트 직렬 내적
-    def serial_dot(self, lanes, gates, nbits, kind, unsigned_lanes=False):
-        """lanes: 레인 12개 값 (레인 옆 레지스터), gates: c 선에 나올 값 12개 (가중치/캐시).
-        nbits 바퀴, 맨 위 비트(무게 -2^(n-1))부터. 첫 바퀴: acc = -S, 나머지: acc = 2*acc + S."""
+    def serial_dot(self, lanes, gates, nbits, kind, signed_gates=True):
+        """lanes: 레인 12개 값 (레인 옆 칸, 부호 있는 8비트), gates: c 선에 나올 값 12개.
+        nbits 바퀴, 맨 위 비트부터. 부호 있는 c 값이면 첫 바퀴 acc = -S (무게 -2^(n-1)),
+        부호 없는 c 값(p)이면 첫 바퀴도 +S. 나머지 바퀴는 acc = 2*acc + S."""
         used = [x for x, w in zip(lanes, gates) if w != 0]    # 게이트가 0인 레인은 값이 뭐든 안 더해짐
-        self.chk("레인 입력(부호 없음)" if unsigned_lanes else "레인 입력(int8)", used)
+        self.chk("레인 입력(int8)", used)
         acc = 0
         for r in range(nbits):
             k = nbits - 1 - r
             S = sum(x for x, w in zip(lanes, gates) if bit(w, k, nbits))
             self.chk("레인 합 S(12비트)", S)
-            acc = -S if r == 0 else 2 * acc + S
+            acc = (-S if signed_gates else S) if r == 0 else 2 * acc + S
             self.chk("누산기(16비트)", acc)
         self.rounds[kind] = self.rounds.get(kind, 0) + nbits
         return acc
@@ -304,7 +306,7 @@ class NPU:
         elif op == "SCORE":
             s = []
             for j in range(P + 1):
-                acc = self.serial_dot(self.lanes_of("Q"), self.K[j], 8, "SCORE")
+                acc = self.serial_dot(self.K[j], self.lanes_of("Q"), 8, "SCORE")   # 레인 = K_j, c = Q 비트
                 v = shr(acc, imm)
                 self.chk("점수(8비트)", v)
                 self.write_lane("S", j, v)
@@ -327,7 +329,7 @@ class NPU:
         elif op == "MIXV":
             out = []
             for i in range(D):                             # 레인 = 위치 j, c 선 = V 캐시의 원소 i 줄
-                acc = self.serial_dot(self.lanes_of("P"), self.V[i], 8, "MIXV", unsigned_lanes=True)
+                acc = self.serial_dot(self.V[i], self.lanes_of("P"), 8, "MIXV", signed_gates=False)  # 레인 = V, c = p 비트
                 v = shr(acc, imm)
                 self.write_lane("A", i, v)
                 out.append(v)
@@ -356,8 +358,8 @@ class NPU:
     def show(self, op, rname):
         if op == "EMB": return f"X(칸0) = {self.slot[0][:D]}"
         if op in ("MV", "MVADD"):
-            if rname == "KC": return f"K캐시[{self.P}] = {self.K[self.P][:D]}"
-            if rname == "VC": return f"V캐시[{self.P}] = {[self.V[i][self.P] for i in range(D)]}"
+            if rname == "KC": return f"K 칸(위치 {self.P}) = {self.K[self.P][:D]}"
+            if rname == "VC": return f"V 칸들의 레인 {self.P} = {[self.V[i][self.P] for i in range(D)]}"
             n = FFN if rname == "H" else D
             return f"{rname}(칸{SLOT_OF[rname]}) = {self.lanes_of(rname)[:n]}"
         if op == "SCORE": return f"s(칸2) = {self.s}"
